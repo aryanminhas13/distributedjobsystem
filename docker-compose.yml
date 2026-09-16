@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: jobs
+      POSTGRES_PASSWORD: jobs
+      POSTGRES_DB: jobs
+    ports: ["5432:5432"]
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobs"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+  api:
+    build: ./server
+    environment:
+      DATABASE_URL: postgres://jobs:jobs@postgres:5432/jobs?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      PORT: "8080"
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+  worker:
+    build: ./server
+    command: ["worker"]
+    environment:
+      DATABASE_URL: postgres://jobs:jobs@postgres:5432/jobs?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      api: { condition: service_started }
+  dashboard:
+    build: ./dashboard
+    ports: ["5173:80"]
+    depends_on: [api]
+
+volumes:
+  postgres-data:
+  redis-data:
