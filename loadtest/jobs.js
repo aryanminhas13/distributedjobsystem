@@ -8,5 +8,5 @@ export const options = {
 };
 export default function () {
   const r = http.post(`${__ENV.BASE_URL || 'http://localhost:8080'}/api/jobs`, JSON.stringify({ name: 'benchmark', payload: { sequence: __ITER, durationMs: 25 }, maxAttempts: 3 }), { headers: { 'Content-Type': 'application/json' } });
-  check(r, { accepted: x => x.status === 200 });
+  check(r, { accepted: x => x.status === 201 });
 }

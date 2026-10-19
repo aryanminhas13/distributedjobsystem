@@ -14,9 +14,11 @@ Open `http://localhost:5173`. Submit a job from the dashboard; workers simulate 
 
 - `POST /api/jobs` submit `{ "name": "daily-report", "payload": { ... }, "maxAttempts": 3, "runAt": "RFC3339 optional" }`
 - `GET /api/jobs`, `GET /api/jobs/:id`, `POST /api/jobs/:id/cancel`
-- `GET /api/metrics`, `GET /ws`
+- `GET /api/metrics`, `GET /healthz`, `GET /ws`
 
 The API stores durable job records in Postgres and uses Redis Streams consumer groups for delivery. A reaper periodically reclaims pending messages from failed workers. The worker applies exponential retry backoff and respects cancellation.
+
+The dashboard exposes scheduling, status filtering, WebSocket connection health, API errors, and measured p95 dispatch latency. Enable “Fail the first attempt” to exercise retry recovery end to end.
 
 ## Load test
 

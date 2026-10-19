@@ -28,5 +28,5 @@ export default function () {
     { headers: { 'Content-Type': 'application/json' } },
   );
 
-  check(response, { accepted: (result) => result.status === 200 });
+  check(response, { accepted: (result) => result.status === 201 });
 }
