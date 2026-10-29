@@ -1,48 +1,413 @@
 package main
 
 import (
-  "context"
-  "encoding/json"
-  "fmt"
-  "log"
-  "math"
-  "net/http"
-  "os"
-  "strings"
-  "sync"
-  "time"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"math"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
 
-  "github.com/go-chi/chi/v5"
-  "github.com/redis/go-redis/v9"
-  "github.com/google/uuid"
-  "github.com/gorilla/websocket"
-  "github.com/jackc/pgx/v5/pgxpool"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/attribute"
 )
 
-const stream = "jobs"; const group = "workers"; const eventChannel = "job-events"
-type Job struct { ID string `json:"id"`; Name string `json:"name"`; Payload map[string]any `json:"payload"`; Status string `json:"status"`; Attempts int `json:"attempts"`; MaxAttempts int `json:"maxAttempts"`; RunAt time.Time `json:"runAt"`; CreatedAt time.Time `json:"createdAt"`; StartedAt *time.Time `json:"startedAt,omitempty"`; FinishedAt *time.Time `json:"finishedAt,omitempty"`; Error *string `json:"error,omitempty"` }
-type Event struct { Type string `json:"type"`; Job Job `json:"job"`; Message string `json:"message,omitempty"`; At time.Time `json:"at"` }
-type App struct { db *pgxpool.Pool; rdb *redis.Client; clients map[*websocket.Conn]bool; mu sync.Mutex; broadcast chan Event }
+const stream = "jobs"
+const group = "workers"
+const eventChannel = "job-events"
+const deadLetterStream = "jobs:dlq"
 
-func env(k, d string) string { if v:=os.Getenv(k); v!="" { return v }; return d }
-func main() { ctx:=context.Background(); db,err:=pgxpool.New(ctx,env("DATABASE_URL","postgres://jobs:jobs@localhost:5432/jobs?sslmode=disable")); if err!=nil {log.Fatal(err)}; ro,err:=redis.ParseURL(env("REDIS_URL","redis://localhost:6379/0"));if err!=nil{log.Fatal(err)}; rdb:=redis.NewClient(ro); a:=&App{db:db,rdb:rdb,clients:map[*websocket.Conn]bool{},broadcast:make(chan Event,256)}; if err=a.migrate(ctx);err!=nil {log.Fatal(err)}; if len(os.Args)>1&&os.Args[1]=="worker" { a.worker(ctx); return }; go a.fanout(); go a.consumeEvents(ctx); go a.scheduler(ctx); r:=chi.NewRouter(); r.Use(cors); r.Get("/healthz",a.health); r.Get("/api/jobs",a.list); r.Post("/api/jobs",a.submit); r.Get("/api/jobs/{id}",a.get); r.Post("/api/jobs/{id}/cancel",a.cancel); r.Get("/api/metrics",a.metrics); r.Get("/ws",a.ws); log.Printf("API listening on :%s",env("PORT","8080")); log.Fatal(http.ListenAndServe("0.0.0.0:"+env("PORT","8080"),r)) }
-func (a *App) migrate(c context.Context) error { _,e:=a.db.Exec(c,`CREATE TABLE IF NOT EXISTS jobs (id uuid PRIMARY KEY,name text NOT NULL,payload jsonb NOT NULL DEFAULT '{}',status text NOT NULL,attempts int NOT NULL DEFAULT 0,max_attempts int NOT NULL DEFAULT 3,run_at timestamptz NOT NULL DEFAULT now(),created_at timestamptz NOT NULL DEFAULT now(),started_at timestamptz,finished_at timestamptz,error text); CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status,run_at);`); return e }
-func (a *App) enqueue(c context.Context,id string) error { return a.rdb.XAdd(c,&redis.XAddArgs{Stream:stream,Values:map[string]any{"job_id":id}}).Err() }
-func (a *App) submit(w http.ResponseWriter,r *http.Request) { var in struct{Name string `json:"name"`; Payload map[string]any `json:"payload"`; MaxAttempts int `json:"maxAttempts"`; RunAt *time.Time `json:"runAt"`};r.Body=http.MaxBytesReader(w,r.Body,1<<20);dec:=json.NewDecoder(r.Body);dec.DisallowUnknownFields(); if dec.Decode(&in)!=nil {http.Error(w,"invalid JSON request",400);return};in.Name=strings.TrimSpace(in.Name);if in.Name==""||len(in.Name)>120 {http.Error(w,"name must be between 1 and 120 characters",400);return}; if in.MaxAttempts==0 {in.MaxAttempts=3};if in.MaxAttempts<1||in.MaxAttempts>20{http.Error(w,"maxAttempts must be between 1 and 20",400);return};if in.Payload==nil{in.Payload=map[string]any{}}; run:=time.Now();if in.RunAt!=nil {run=*in.RunAt}; status:="queued";if run.After(time.Now()){status="scheduled"}; j:=Job{ID:uuid.NewString(),Name:in.Name,Payload:in.Payload,Status:status,MaxAttempts:in.MaxAttempts,RunAt:run,CreatedAt:time.Now()}; _,e:=a.db.Exec(r.Context(),`INSERT INTO jobs(id,name,payload,status,max_attempts,run_at) VALUES($1,$2,$3,$4,$5,$6)`,j.ID,j.Name,j.Payload,j.Status,j.MaxAttempts,j.RunAt);if e!=nil {http.Error(w,"could not persist job",500);return}; if status=="queued" {if e=a.enqueue(r.Context(),j.ID);e!=nil{a.db.Exec(r.Context(),`UPDATE jobs SET status='scheduled',run_at=now() WHERE id=$1`,j.ID);http.Error(w,"queue temporarily unavailable; job will be retried",503);return}};a.emit(Event{"job.created",j,"Job accepted",time.Now()});w.Header().Set("Content-Type","application/json");w.WriteHeader(http.StatusCreated);json.NewEncoder(w).Encode(j) }
-func (a *App) health(w http.ResponseWriter,r *http.Request){ctx,cancel:=context.WithTimeout(r.Context(),2*time.Second);defer cancel();if e:=a.db.Ping(ctx);e!=nil{http.Error(w,"database unavailable",503);return};if e:=a.rdb.Ping(ctx).Err();e!=nil{http.Error(w,"queue unavailable",503);return};w.Header().Set("Content-Type","application/json");json.NewEncoder(w).Encode(map[string]string{"status":"ok"})}
-func scan(row interface{Scan(...any) error})(Job,error) { var j Job; var payload []byte; e:=row.Scan(&j.ID,&j.Name,&payload,&j.Status,&j.Attempts,&j.MaxAttempts,&j.RunAt,&j.CreatedAt,&j.StartedAt,&j.FinishedAt,&j.Error);json.Unmarshal(payload,&j.Payload);return j,e }
-const selectJob=`SELECT id,name,payload,status,attempts,max_attempts,run_at,created_at,started_at,finished_at,error FROM jobs`
-func (a *App) get(w http.ResponseWriter,r *http.Request){j,e:=scan(a.db.QueryRow(r.Context(),selectJob+` WHERE id=$1`,chi.URLParam(r,"id")));if e!=nil {http.Error(w,"not found",404);return};json.NewEncoder(w).Encode(j)}
-func (a *App) list(w http.ResponseWriter,r *http.Request){rows,e:=a.db.Query(r.Context(),selectJob+` ORDER BY created_at DESC LIMIT 100`);if e!=nil {http.Error(w,e.Error(),500);return};defer rows.Close();js:=[]Job{};for rows.Next(){j,_:=scan(rows);js=append(js,j)};json.NewEncoder(w).Encode(js)}
-func (a *App) cancel(w http.ResponseWriter,r *http.Request){j,e:=scan(a.db.QueryRow(r.Context(),`UPDATE jobs SET status='cancelled',finished_at=now() WHERE id=$1 AND status IN ('queued','running','retrying') RETURNING `+strings.TrimPrefix(selectJob,"SELECT ")));if e!=nil {http.Error(w,"job cannot be cancelled",409);return};a.emit(Event{"job.cancelled",j,"Cancellation requested",time.Now()});json.NewEncoder(w).Encode(j)}
-func (a *App) metrics(w http.ResponseWriter,r *http.Request){ var queued,running,done,failed int;var p95 float64;a.db.QueryRow(r.Context(),`SELECT count(*) FILTER(WHERE status IN ('queued','retrying')),count(*) FILTER(WHERE status='running'),count(*) FILTER(WHERE status='completed'),count(*) FILTER(WHERE status='failed'),COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM(started_at-created_at))*1000) FILTER(WHERE started_at IS NOT NULL),0) FROM jobs`).Scan(&queued,&running,&done,&failed,&p95);json.NewEncoder(w).Encode(map[string]any{"queued":queued,"running":running,"completed":done,"failed":failed,"p95DispatchMs":p95}) }
-func (a *App) scheduler(c context.Context){t:=time.NewTicker(time.Second);for range t.C {rows,_:=a.db.Query(c,`UPDATE jobs SET status='queued' WHERE status IN ('scheduled','retrying') AND run_at<=now() RETURNING id`);for rows.Next(){var id string;rows.Scan(&id);a.enqueue(c,id)};rows.Close()}}
-func (a *App) worker(c context.Context){a.rdb.XGroupCreateMkStream(c,stream,group,"0"); worker:="worker-"+uuid.NewString()[:8]; log.Println("started",worker);go a.reclaim(c,worker);for {res,e:=a.rdb.XReadGroup(c,&redis.XReadGroupArgs{Group:group,Consumer:worker,Streams:[]string{stream,">"},Count:5,Block:3*time.Second}).Result();if e!=nil&&e!=redis.Nil {continue};for _,s:=range res{for _,m:=range s.Messages{id:=fmt.Sprint(m.Values["job_id"]);a.process(c,id);a.rdb.XAck(c,stream,group,m.ID)}}}}
-func (a *App) reclaim(c context.Context,worker string){t:=time.NewTicker(15*time.Second);defer t.Stop();for range t.C {start:="0-0";for {msgs,next,e:=a.rdb.XAutoClaim(c,&redis.XAutoClaimArgs{Stream:stream,Group:group,Consumer:worker,MinIdle:30*time.Second,Start:start,Count:20}).Result();if e!=nil||len(msgs)==0 {break};for _,m:=range msgs {a.process(c,fmt.Sprint(m.Values["job_id"]));a.rdb.XAck(c,stream,group,m.ID)};if next==start {break};start=next}}}
-func (a *App) process(c context.Context,id string){j,e:=scan(a.db.QueryRow(c,selectJob+` WHERE id=$1`,id));if e!=nil||j.Status=="cancelled"||j.Status=="completed"||j.Status=="failed" {return};now:=time.Now();tag,e:=a.db.Exec(c,`UPDATE jobs SET status='running',attempts=attempts+1,started_at=now() WHERE id=$1 AND status IN ('queued','retrying','running')`,id);if e!=nil||tag.RowsAffected()==0{return};j.Status="running";j.Attempts++;j.StartedAt=&now;a.emit(Event{"job.running",j,"Worker started execution",now});duration:=time.Duration(250+len(j.Name)%750)*time.Millisecond;if v,ok:=j.Payload["durationMs"].(float64);ok&&v>=0&&v<=60000{duration=time.Duration(v)*time.Millisecond};time.Sleep(duration);status:="completed";msg:="Execution completed";shouldFail:=j.Payload["fail"]==true;if v,ok:=j.Payload["failUntilAttempt"].(float64);ok&&j.Attempts<=int(v){shouldFail=true};if shouldFail {if j.Attempts<j.MaxAttempts {status="retrying";msg="Transient failure; retry scheduled"}else{status="failed";msg="Maximum attempts reached"}};if status=="retrying" {delay:=time.Duration(math.Pow(2,float64(j.Attempts)))*time.Second;a.db.Exec(c,`UPDATE jobs SET status='retrying',run_at=$2,error=$3 WHERE id=$1 AND status!='cancelled'`,id,time.Now().Add(delay),msg);j.Status=status;j.Error=&msg;a.emit(Event{"job.retrying",j,msg,time.Now()});return};tag,_=a.db.Exec(c,`UPDATE jobs SET status=$2,finished_at=now(),error=$3 WHERE id=$1 AND status!='cancelled'`,id,status,func()any{if status=="failed"{return msg};return nil}());if tag.RowsAffected()==0{return};j.Status=status;end:=time.Now();j.FinishedAt=&end;if status=="failed"{j.Error=&msg};a.emit(Event{"job."+status,j,msg,end})}
-func (a *App) emit(e Event){b,_:=json.Marshal(e);a.rdb.Publish(context.Background(),eventChannel,b)}
-func (a *App) consumeEvents(c context.Context){ch:=a.rdb.Subscribe(c,eventChannel).Channel();for m:=range ch {var e Event;if json.Unmarshal([]byte(m.Payload),&e)==nil {select{case a.broadcast<-e:default:}}}}
-func (a *App) fanout(){for e:=range a.broadcast {b,_:=json.Marshal(e);a.mu.Lock();for c:=range a.clients {if c.WriteMessage(websocket.TextMessage,b)!=nil {c.Close();delete(a.clients,c)}};a.mu.Unlock()}}
-var up=websocket.Upgrader{CheckOrigin:func(*http.Request)bool{return true}}
-func(a *App)ws(w http.ResponseWriter,r *http.Request){c,e:=up.Upgrade(w,r,nil);if e!=nil{return};a.mu.Lock();a.clients[c]=true;a.mu.Unlock()}
-func cors(next http.Handler)http.Handler{return http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){w.Header().Set("Access-Control-Allow-Origin","*");w.Header().Set("Access-Control-Allow-Headers","Content-Type");if r.Method=="OPTIONS"{w.WriteHeader(204);return};next.ServeHTTP(w,r)})}
+type Job struct {
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Payload     map[string]any `json:"payload"`
+	Status      string         `json:"status"`
+	Attempts    int            `json:"attempts"`
+	MaxAttempts int            `json:"maxAttempts"`
+	RunAt       time.Time      `json:"runAt"`
+	CreatedAt   time.Time      `json:"createdAt"`
+	StartedAt   *time.Time     `json:"startedAt,omitempty"`
+	FinishedAt  *time.Time     `json:"finishedAt,omitempty"`
+	Error       *string        `json:"error,omitempty"`
+}
+type Event struct {
+	Type    string    `json:"type"`
+	Job     Job       `json:"job"`
+	Message string    `json:"message,omitempty"`
+	At      time.Time `json:"at"`
+}
+type App struct {
+	db        *pgxpool.Pool
+	rdb       *redis.Client
+	clients   map[*websocket.Conn]bool
+	mu        sync.Mutex
+	broadcast chan Event
+}
+
+func env(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
+}
+func main() {
+	ctx := context.Background()
+	shutdown, e := initTelemetry(ctx)
+	if e != nil {
+		log.Fatal(e)
+	}
+	defer shutdown(context.Background())
+	db, err := pgxpool.New(ctx, env("DATABASE_URL", "postgres://jobs:jobs@localhost:5432/jobs?sslmode=disable"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	ro, err := redis.ParseURL(env("REDIS_URL", "redis://localhost:6379/0"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	rdb := redis.NewClient(ro)
+	a := &App{db: db, rdb: rdb, clients: map[*websocket.Conn]bool{}, broadcast: make(chan Event, 256)}
+	if err = a.migrate(ctx); err != nil {
+		log.Fatal(err)
+	}
+	if len(os.Args) > 1 && os.Args[1] == "worker" {
+		a.worker(ctx)
+		return
+	}
+	go a.fanout()
+	go a.consumeEvents(ctx)
+	go a.scheduler(ctx)
+	r := chi.NewRouter()
+	r.Use(cors)
+	r.Use(observabilityMiddleware)
+	r.Get("/healthz", a.health)
+	r.Get("/api/jobs", a.authorize("viewer", a.list))
+	r.Post("/api/jobs", a.authorize("operator", a.submit))
+	r.Get("/api/jobs/{id}", a.authorize("viewer", a.get))
+	r.Post("/api/jobs/{id}/cancel", a.authorize("operator", a.cancel))
+	r.Get("/api/dlq", a.authorize("viewer", a.listDLQ))
+	r.Post("/api/dlq/{id}/replay", a.authorize("admin", a.replayDLQ))
+	r.Get("/api/audit", a.authorize("admin", a.listAudit))
+	r.Get("/api/metrics", a.authorize("viewer", a.metrics))
+	r.Get("/ws", a.ws)
+	log.Printf("API listening on :%s", env("PORT", "8080"))
+	log.Fatal(http.ListenAndServe("0.0.0.0:"+env("PORT", "8080"), r))
+}
+func (a *App) migrate(c context.Context) error {
+	_, e := a.db.Exec(c, `CREATE TABLE IF NOT EXISTS jobs (id uuid PRIMARY KEY,name text NOT NULL,payload jsonb NOT NULL DEFAULT '{}',status text NOT NULL,attempts int NOT NULL DEFAULT 0,max_attempts int NOT NULL DEFAULT 3,run_at timestamptz NOT NULL DEFAULT now(),created_at timestamptz NOT NULL DEFAULT now(),started_at timestamptz,finished_at timestamptz,error text,dead_lettered_at timestamptz); ALTER TABLE jobs ADD COLUMN IF NOT EXISTS dead_lettered_at timestamptz; CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status,run_at); CREATE TABLE IF NOT EXISTS audit_logs(id bigserial PRIMARY KEY,actor text NOT NULL,role text NOT NULL,action text NOT NULL,target text NOT NULL,metadata jsonb NOT NULL DEFAULT '{}',created_at timestamptz NOT NULL DEFAULT now()); CREATE INDEX IF NOT EXISTS audit_logs_created_idx ON audit_logs(created_at DESC);`)
+	return e
+}
+func (a *App) enqueue(c context.Context, id string) error {
+	return a.rdb.XAdd(c, &redis.XAddArgs{Stream: stream, Values: map[string]any{"job_id": id}}).Err()
+}
+func (a *App) submit(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name        string         `json:"name"`
+		Payload     map[string]any `json:"payload"`
+		MaxAttempts int            `json:"maxAttempts"`
+		RunAt       *time.Time     `json:"runAt"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if dec.Decode(&in) != nil {
+		http.Error(w, "invalid JSON request", 400)
+		return
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	if in.Name == "" || len(in.Name) > 120 {
+		http.Error(w, "name must be between 1 and 120 characters", 400)
+		return
+	}
+	if in.MaxAttempts == 0 {
+		in.MaxAttempts = 3
+	}
+	if in.MaxAttempts < 1 || in.MaxAttempts > 20 {
+		http.Error(w, "maxAttempts must be between 1 and 20", 400)
+		return
+	}
+	if in.Payload == nil {
+		in.Payload = map[string]any{}
+	}
+	run := time.Now()
+	if in.RunAt != nil {
+		run = *in.RunAt
+	}
+	status := "queued"
+	if run.After(time.Now()) {
+		status = "scheduled"
+	}
+	j := Job{ID: uuid.NewString(), Name: in.Name, Payload: in.Payload, Status: status, MaxAttempts: in.MaxAttempts, RunAt: run, CreatedAt: time.Now()}
+	_, e := a.db.Exec(r.Context(), `INSERT INTO jobs(id,name,payload,status,max_attempts,run_at) VALUES($1,$2,$3,$4,$5,$6)`, j.ID, j.Name, j.Payload, j.Status, j.MaxAttempts, j.RunAt)
+	if e != nil {
+		http.Error(w, "could not persist job", 500)
+		return
+	}
+	if status == "queued" {
+		if e = a.enqueue(r.Context(), j.ID); e != nil {
+			a.db.Exec(r.Context(), `UPDATE jobs SET status='scheduled',run_at=now() WHERE id=$1`, j.ID)
+			http.Error(w, "queue temporarily unavailable; job will be retried", 503)
+			return
+		}
+	}
+	a.audit(r, "job.submit", j.ID, map[string]any{"name": j.Name, "runAt": j.RunAt})
+	a.emit(Event{"job.created", j, "Job accepted", time.Now()})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(j)
+}
+func (a *App) health(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if e := a.db.Ping(ctx); e != nil {
+		http.Error(w, "database unavailable", 503)
+		return
+	}
+	if e := a.rdb.Ping(ctx).Err(); e != nil {
+		http.Error(w, "queue unavailable", 503)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+func scan(row interface{ Scan(...any) error }) (Job, error) {
+	var j Job
+	var payload []byte
+	e := row.Scan(&j.ID, &j.Name, &payload, &j.Status, &j.Attempts, &j.MaxAttempts, &j.RunAt, &j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.Error)
+	json.Unmarshal(payload, &j.Payload)
+	return j, e
+}
+
+const jobColumns = `id,name,payload,status,attempts,max_attempts,run_at,created_at,started_at,finished_at,error`
+const selectJob = `SELECT ` + jobColumns + ` FROM jobs`
+
+func (a *App) get(w http.ResponseWriter, r *http.Request) {
+	j, e := scan(a.db.QueryRow(r.Context(), selectJob+` WHERE id=$1`, chi.URLParam(r, "id")))
+	if e != nil {
+		http.Error(w, "not found", 404)
+		return
+	}
+	json.NewEncoder(w).Encode(j)
+}
+func (a *App) list(w http.ResponseWriter, r *http.Request) {
+	rows, e := a.db.Query(r.Context(), selectJob+` ORDER BY created_at DESC LIMIT 100`)
+	if e != nil {
+		http.Error(w, e.Error(), 500)
+		return
+	}
+	defer rows.Close()
+	js := []Job{}
+	for rows.Next() {
+		j, _ := scan(rows)
+		js = append(js, j)
+	}
+	json.NewEncoder(w).Encode(js)
+}
+func (a *App) cancel(w http.ResponseWriter, r *http.Request) {
+	j, e := scan(a.db.QueryRow(r.Context(), `UPDATE jobs SET status='cancelled',finished_at=now() WHERE id=$1 AND status IN ('queued','scheduled','running','retrying') RETURNING `+jobColumns, chi.URLParam(r, "id")))
+	if e != nil {
+		http.Error(w, "job cannot be cancelled", 409)
+		return
+	}
+	a.audit(r, "job.cancel", j.ID, nil)
+	a.emit(Event{"job.cancelled", j, "Cancellation requested", time.Now()})
+	json.NewEncoder(w).Encode(j)
+}
+func (a *App) metrics(w http.ResponseWriter, r *http.Request) {
+	var queued, running, done, failed int
+	var p95 float64
+	a.db.QueryRow(r.Context(), `SELECT count(*) FILTER(WHERE status IN ('queued','retrying')),count(*) FILTER(WHERE status='running'),count(*) FILTER(WHERE status='completed'),count(*) FILTER(WHERE status='failed'),COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM(started_at-created_at))*1000) FILTER(WHERE started_at IS NOT NULL),0) FROM jobs`).Scan(&queued, &running, &done, &failed, &p95)
+	json.NewEncoder(w).Encode(map[string]any{"queued": queued, "running": running, "completed": done, "failed": failed, "p95DispatchMs": p95})
+}
+func (a *App) scheduler(c context.Context) {
+	t := time.NewTicker(time.Second)
+	for range t.C {
+		rows, _ := a.db.Query(c, `UPDATE jobs SET status='queued' WHERE status IN ('scheduled','retrying') AND run_at<=now() RETURNING id`)
+		for rows.Next() {
+			var id string
+			rows.Scan(&id)
+			a.enqueue(c, id)
+		}
+		rows.Close()
+	}
+}
+func (a *App) worker(c context.Context) {
+	a.rdb.XGroupCreateMkStream(c, stream, group, "0")
+	worker := "worker-" + uuid.NewString()[:8]
+	log.Println("started", worker)
+	go a.reclaim(c, worker)
+	for {
+		res, e := a.rdb.XReadGroup(c, &redis.XReadGroupArgs{Group: group, Consumer: worker, Streams: []string{stream, ">"}, Count: 5, Block: 3 * time.Second}).Result()
+		if e != nil && e != redis.Nil {
+			continue
+		}
+		for _, s := range res {
+			for _, m := range s.Messages {
+				id := fmt.Sprint(m.Values["job_id"])
+				a.process(c, id)
+				a.rdb.XAck(c, stream, group, m.ID)
+			}
+		}
+	}
+}
+func (a *App) reclaim(c context.Context, worker string) {
+	t := time.NewTicker(15 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		start := "0-0"
+		for {
+			msgs, next, e := a.rdb.XAutoClaim(c, &redis.XAutoClaimArgs{Stream: stream, Group: group, Consumer: worker, MinIdle: 30 * time.Second, Start: start, Count: 20}).Result()
+			if e != nil || len(msgs) == 0 {
+				break
+			}
+			for _, m := range msgs {
+				a.process(c, fmt.Sprint(m.Values["job_id"]))
+				a.rdb.XAck(c, stream, group, m.ID)
+			}
+			if next == start {
+				break
+			}
+			start = next
+		}
+	}
+}
+func (a *App) process(c context.Context, id string) {
+	c, span := jobTracer.Start(c, "job.process")
+	defer span.End()
+	j, e := scan(a.db.QueryRow(c, selectJob+` WHERE id=$1`, id))
+	if e != nil || j.Status == "cancelled" || j.Status == "completed" || j.Status == "failed" {
+		return
+	}
+	span.SetAttributes(attribute.String("job.id", j.ID), attribute.String("job.name", j.Name), attribute.Int("job.attempt", j.Attempts+1))
+	now := time.Now()
+	tag, e := a.db.Exec(c, `UPDATE jobs SET status='running',attempts=attempts+1,started_at=now() WHERE id=$1 AND status IN ('queued','retrying','running')`, id)
+	if e != nil || tag.RowsAffected() == 0 {
+		return
+	}
+	j.Status = "running"
+	j.Attempts++
+	j.StartedAt = &now
+	jobsStarted.Add(c, 1)
+	a.emit(Event{"job.running", j, "Worker started execution", now})
+	duration := time.Duration(250+len(j.Name)%750) * time.Millisecond
+	if v, ok := j.Payload["durationMs"].(float64); ok && v >= 0 && v <= 60000 {
+		duration = time.Duration(v) * time.Millisecond
+	}
+	time.Sleep(duration)
+	status := "completed"
+	msg := "Execution completed"
+	shouldFail := j.Payload["fail"] == true
+	if v, ok := j.Payload["failUntilAttempt"].(float64); ok && j.Attempts <= int(v) {
+		shouldFail = true
+	}
+	if shouldFail {
+		if j.Attempts < j.MaxAttempts {
+			status = "retrying"
+			msg = "Transient failure; retry scheduled"
+		} else {
+			status = "failed"
+			msg = "Maximum attempts reached"
+		}
+	}
+	if status == "retrying" {
+		delay := time.Duration(math.Pow(2, float64(j.Attempts))) * time.Second
+		a.db.Exec(c, `UPDATE jobs SET status='retrying',run_at=$2,error=$3 WHERE id=$1 AND status!='cancelled'`, id, time.Now().Add(delay), msg)
+		j.Status = status
+		j.Error = &msg
+		jobsRetried.Add(c, 1)
+		a.emit(Event{"job.retrying", j, msg, time.Now()})
+		return
+	}
+	tag, _ = a.db.Exec(c, `UPDATE jobs SET status=$2,finished_at=now(),error=$3,dead_lettered_at=CASE WHEN $2='failed' THEN now() ELSE NULL END WHERE id=$1 AND status!='cancelled'`, id, status, func() any {
+		if status == "failed" {
+			return msg
+		}
+		return nil
+	}())
+	if tag.RowsAffected() == 0 {
+		return
+	}
+	j.Status = status
+	end := time.Now()
+	j.FinishedAt = &end
+	if status == "failed" {
+		j.Error = &msg
+		jobsFailed.Add(c, 1)
+		a.rdb.XAdd(c, &redis.XAddArgs{Stream: deadLetterStream, Values: map[string]any{"job_id": j.ID, "error": msg, "attempts": j.Attempts, "failed_at": end.Format(time.RFC3339Nano)}})
+	} else {
+		jobsCompleted.Add(c, 1)
+	}
+	a.emit(Event{"job." + status, j, msg, end})
+}
+func (a *App) emit(e Event) {
+	b, _ := json.Marshal(e)
+	a.rdb.Publish(context.Background(), eventChannel, b)
+}
+func (a *App) consumeEvents(c context.Context) {
+	ch := a.rdb.Subscribe(c, eventChannel).Channel()
+	for m := range ch {
+		var e Event
+		if json.Unmarshal([]byte(m.Payload), &e) == nil {
+			select {
+			case a.broadcast <- e:
+			default:
+			}
+		}
+	}
+}
+func (a *App) fanout() {
+	for e := range a.broadcast {
+		b, _ := json.Marshal(e)
+		a.mu.Lock()
+		for c := range a.clients {
+			if c.WriteMessage(websocket.TextMessage, b) != nil {
+				c.Close()
+				delete(a.clients, c)
+			}
+		}
+		a.mu.Unlock()
+	}
+}
+
+var up = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+
+func (a *App) ws(w http.ResponseWriter, r *http.Request) {
+	if roleRank[requestRole(r)] < roleRank["viewer"] {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	headers := http.Header{}
+	for _, protocol := range websocket.Subprotocols(r) {
+		if strings.HasPrefix(protocol, "bearer.") {
+			headers.Set("Sec-WebSocket-Protocol", protocol)
+			break
+		}
+	}
+	c, e := up.Upgrade(w, r, headers)
+	if e != nil {
+		return
+	}
+	a.mu.Lock()
+	a.clients[c] = true
+	a.mu.Unlock()
+}
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Actor-ID")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(204)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

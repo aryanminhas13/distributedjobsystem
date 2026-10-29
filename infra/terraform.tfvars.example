@@ -1,0 +1,7 @@
+project             = "djobs"
+environment         = "prod"
+location            = "canadacentral"
+worker_min_replicas = 2
+worker_max_replicas = 20
+alert_email         = "you@example.com"
+monthly_budget_cad  = 150

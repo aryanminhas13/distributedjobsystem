@@ -1,7 +1,9 @@
-FROM golang:1.22-alpine AS build
+FROM golang:1.25-alpine AS build
 WORKDIR /src
-COPY . .
-RUN go mod tidy && CGO_ENABLED=0 go build -o /out/orchestrator .
-FROM alpine:3.20
+COPY go.mod go.sum ./
+RUN go mod download
+COPY *.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/orchestrator .
+FROM alpine:3.22
 COPY --from=build /out/orchestrator /app/orchestrator
 ENTRYPOINT ["/app/orchestrator"]
